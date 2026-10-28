@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xwt"
+dynamic = ["version"]
+description = "Named multi-repo git worktrees: a toplevel, its sub-repos, and sibling worktrees on one branch per name"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+xwt = "xwt.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "xwt.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
