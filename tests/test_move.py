@@ -282,3 +282,86 @@ def test_merge_with_a_missing_sub_repo(w):
     assert r.rc == 0, r.all
     assert "xwt: warning: dev has no checkout of libb" in r.err
     assert w.rev(w.top / "liba", "kms") == tip
+
+
+# ---------------------------------------------------------------------------
+# Cases where git would refuse part way, and branch/tag name clashes
+# ---------------------------------------------------------------------------
+
+def test_merge_refuses_a_dirty_main_checkout_of_a_renamed_file(w):
+    w.setup()
+    dev = w.add_worktree("dev")
+    w.commit(dev / "liba")
+    w.git(dev / "libb", "mv", "libb/__init__.py", "libb/renamed.py")
+    w.git(dev / "libb", "commit", "-q", "-m", "rename")
+    (w.top / "libb" / "libb" / "__init__.py").write_text("edited in top\n")
+    before = w.rev(w.top / "liba", "kms")
+    r = w.xwt("merge-up", cwd=dev)
+    assert r.rc == 1
+    assert "top/libb has uncommitted changes to, or untracked copies of, files the merge " \
+           "changes (libb/__init__.py)" in r.err
+    assert w.rev(w.top / "liba", "kms") == before     # nothing landed
+
+
+def test_no_ff_refuses_a_staged_index(w):
+    w.setup()
+    dev = w.add_worktree("dev")
+    w.commit(dev / "liba")
+    w.commit(dev / "libb")
+    (w.top / "libb" / "unrelated.txt").write_text("staged\n")
+    w.git(w.top / "libb", "add", "unrelated.txt")
+    before = w.rev(w.top / "liba", "kms")
+    r = w.xwt("merge-up", "--no-ff", cwd=dev)
+    assert r.rc == 1
+    assert "top/libb has staged changes, and a merge commit needs a clean index" in r.err
+    assert w.rev(w.top / "liba", "kms") == before
+    # A fast-forward doesn't mind a staged file it doesn't touch.
+    assert w.xwt("merge-up", cwd=dev).rc == 0
+
+
+def test_rebase_refuses_an_untracked_file_it_would_overwrite(w):
+    w.setup()
+    dev = w.add_worktree("dev")
+    w.commit(dev / "liba")
+    w.commit(w.top / "liba", "new.txt", "from kms\n")
+    main = w.commit(w.top)
+    (dev / "liba" / "new.txt").write_text("untracked here\n")
+    r = w.xwt("rebase-down", cwd=dev)
+    assert r.rc == 1
+    assert ("dev/liba has untracked files that the rebase would overwrite (new.txt); move or "
+            "remove them first") in r.err
+    assert not contains(w, dev, main, "dev")
+
+
+def test_a_step_that_fails_without_starting_says_so(w):
+    w.setup()
+    dev = w.add_worktree("dev")
+    w.commit(w.top / "liba")
+    r = w.xwt("rebase-down", "--", "--no-such-option", cwd=dev)
+    assert r.rc == 1
+    assert ("`git rebase` failed in dev/liba (see git's message above); nothing was changed "
+            "there") in r.err
+    assert "resolve the conflicts" not in r.err
+
+
+def test_tags_named_like_branches(w):
+    w.setup()
+    dev = w.add_worktree("dev")
+    old_a = w.rev(w.top / "liba", "kms")
+    w.git(w.top / "liba", "tag", "dev", old_a)        # a tag named like the worktree's branch
+    w.git(w.top / "liba", "tag", "kms", old_a)        # and one like the integration branch
+    w.commit(dev / "liba")
+    kms_a = w.commit(w.top / "liba")
+    r = w.xwt("status", cwd=dev)
+    assert "heads/" not in r.out and "WARNING" not in r.out, r.out
+    r = w.xwt("rebase-down", cwd=dev)
+    assert r.rc == 0, r.all
+    assert f"xwt: $ git -C {dev / 'liba'} rebase refs/heads/kms" in r.out
+    assert contains(w, dev / "liba", kms_a, "refs/heads/dev")
+    tip = w.rev(dev / "liba")
+    r = w.xwt("merge-up", cwd=dev)
+    assert r.rc == 0, r.all
+    assert w.rev(w.top / "liba", "refs/heads/kms") == tip
+    r = w.xwt("new", "dev2")
+    assert r.rc == 0, r.all
+    assert w.rev(w.group / "dev2" / "liba") == tip     # branched from the branch kms, not the tag

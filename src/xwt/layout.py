@@ -35,10 +35,25 @@ def find_workspace(cwd) -> tuple[Path, Path] | None:
         if (d / ".git").exists():
             m = git.main_checkout(d)
             if m is not None and (m / CONFIG_NAME).is_file() and (d == m or d.parent == m.parent):
+                if d == m and d != h and _lists_sub_repo(d.parent, d.name):
+                    # A sub-repo's main checkout that has its own xwt.toml: the
+                    # enclosing toplevel wins (in a worktree, the sibling test
+                    # already sees to that).
+                    return d.parent, d.parent
                 return m, d
         if (under_home and d == h) or d.parent == d:
             return None
         d = d.parent
+
+
+def _lists_sub_repo(top: Path, name: str) -> bool:
+    """Whether `top` is a toplevel whose xwt.toml lists the sub-repo `name`."""
+    if not ((top / ".git").is_dir() and (top / CONFIG_NAME).is_file()):
+        return False
+    try:
+        return name in configmod.load(top / CONFIG_NAME).repos
+    except configmod.ConfigError:
+        return False
 
 
 @dataclass

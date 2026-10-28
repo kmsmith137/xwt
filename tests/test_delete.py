@@ -188,3 +188,51 @@ def test_a_locked_worktree(w):
     r = w.xwt("delete", "dev", "--force")
     assert r.rc == 0, r.all
     assert gone(w, "dev")
+
+
+def test_an_unmanaged_worktree_inside_refuses_even_with_force(w):
+    """E.g. Claude Code's .claude/worktrees/*: ignored, so git status doesn't show it."""
+    w.setup()
+    dev = w.add_worktree("dev")
+    with open(w.top / ".git" / "info" / "exclude", "a") as f:
+        f.write("/.claude/\n")
+    agent = dev / ".claude" / "worktrees" / "agent"
+    w.git(w.top, "worktree", "add", "-q", agent, "-b", "agent", "main")
+    (agent / "work.txt").write_text("uncommitted\n")
+    for args in (["delete", "dev"], ["delete", "dev", "--force"]):
+        r = w.xwt(*args)
+        assert r.rc == 1
+        assert (f"{agent} is a git worktree of {w.top} that xwt doesn't manage; remove it first "
+                f"(`git -C {w.top} worktree remove {agent}`), or move it out") in r.err
+    assert (agent / "work.txt").exists()
+
+
+def test_a_dropped_sub_repo_or_a_nested_clone_refuses(w):
+    w.setup()
+    dev = w.add_worktree("dev")
+    w.write_toml(w.toml(subs=("liba",)))                  # libb dropped from xwt.toml
+    with open(w.top / ".git" / "info" / "exclude", "a") as f:
+        f.write("/extern/\n")
+    w.git(dev, "clone", "-q", w.url("dep"), dev / "extern" / "dep")
+    r = w.xwt("delete", "dev", "--force")
+    assert r.rc == 1
+    assert f"{dev / 'libb'} is a git worktree of" not in r.err   # libb isn't a known repo now
+    assert f"{dev / 'libb'} is a separate git checkout; move it out of {dev} first" in r.err
+    assert f"{dev / 'extern' / 'dep'} is a separate git checkout" in r.err
+    assert (dev / "libb").exists()
+
+
+def test_submodule_commits_stored_only_in_the_worktree(w):
+    w.setup()
+    dev = w.add_worktree("dev")
+    sub = dev / "libb" / "extern" / "dep"
+    w.git(sub, "checkout", "-q", "-b", "local")
+    w.commit(sub)
+    w.git(dev / "libb", "add", "extern/dep")
+    w.git(dev / "libb", "commit", "-q", "-m", "bump dep")
+    assert w.xwt("merge-up", cwd=dev).rc == 0
+    r = w.xwt("delete", "dev")
+    assert r.rc == 1
+    assert ("dev/libb/extern/dep (a submodule) has commits that are on no remote branch; they "
+            "are stored only in this worktree: push them first") in r.err
+    assert w.xwt("delete", "dev", "--force").rc == 0

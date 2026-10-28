@@ -278,6 +278,17 @@ def _branch_busy(repo: Repo, name: str) -> list[str]:
             if e.branch == name and not e.prunable and e.path != repo.main]
 
 
+def _new_branch_problems(project: Project, repo: Repo, name: str) -> list[str]:
+    """Problems with checking out or creating branch `name` in `repo`."""
+    problems = _branch_busy(repo, name)
+    nested = git.out(repo.main, "for-each-ref", "--format=%(refname)", f"refs/heads/{name}/")
+    if nested:
+        other = nested.splitlines()[0][len("refs/heads/"):]
+        problems.append(f"{project.repo_name(repo)} has a branch {other}, so it can't have a "
+                        f"branch {name}; rename that branch, or pick another name")
+    return problems
+
+
 def _add_checkout(project: Project, repo: Repo, path: Path, name: str) -> int:
     """`git worktree add` for one repo: a new branch `name` off the integration
     branch, or the existing branch `name` (§7.4 step 3)."""
@@ -289,7 +300,8 @@ def _add_checkout(project: Project, repo: Repo, path: Path, name: str) -> int:
             ui.info(f"reusing existing branch {name} in {project.repo_name(repo)}: "
                     f"{_relation_to(ab, integ)}")
         return rc
-    return git.git_echo(repo.main, "worktree", "add", str(path), "-b", name, integ)
+    return git.git_echo(repo.main, "worktree", "add", str(path), "-b", name,
+                        git.branch_arg(repo.main, integ))
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +381,7 @@ def _init_worktree(project: Project, *, no_venv: bool) -> int:
     if to_add:
         problems += project.integ_problems([co.repo for co in to_add])
         for co in to_add:
-            problems += _branch_busy(co.repo, ws.name)
+            problems += _new_branch_problems(project, co.repo, ws.name)
     if project.config.envrc is not None:
         problem = envrc.envrc_problem(project, ws)
         if problem:
@@ -408,15 +420,17 @@ def new(project: Project, name: str, *, no_venv: bool) -> int:
         problems.append(f"{target} already exists")
     problems += project.not_cloned_problems()
     problems += project.integ_problems()
-    if not problems:
+    if not check_name(project, name):
         for repo in project.repos:
+            if not project.cloned(repo):
+                continue
             if project.integ(repo) == name:
                 problems.append(f"{name} is the integration branch of "
                                 f"{project.label(project.toplevel, repo)}; pick another name")
-            problems += _branch_busy(repo, name)
-    if project.config.envrc is not None and not problems:
+            problems += _new_branch_problems(project, repo, name)
+    integ = project.integ(project.repos[0])
+    if project.config.envrc is not None and integ:
         # The new checkout is on the integration branch: does that track .envrc?
-        integ = project.integ(project.repos[0])
         if git.ok(project.toplevel, "cat-file", "-e", f"refs/heads/{integ}:.envrc"):
             problems.append(f"xwt.toml has [envrc], but .envrc is tracked in the repo (on "
                             f"{integ}); remove one of them")
@@ -635,18 +649,49 @@ def _finish_hint(op: str, path: Path) -> str:
 
 
 def _run_planned(steps, *, dry_run: bool) -> list[tuple[str, Path]]:
-    """Run (header, path, cmd) steps one after another, each under its header,
-    with git's output going straight to the terminal. Returns the (label, path)
-    of each step that failed."""
+    """Run (header, label, path, cmd) steps one after another, each under its
+    header, with git's output going straight to the terminal. Returns the
+    (label, path) of each step that failed."""
     failed = []
-    for label, path, cmd in steps:
-        ui.header(label)
+    for header, label, path, cmd in steps:
+        ui.header(header)
         if dry_run:
             ui.out(f"{ui.PREFIX}(dry run) $ {ui.cmdline(cmd)}")
         elif git.run_echo(cmd) != 0:
             failed.append((label, path))
         ui.out()
     return failed
+
+
+def _failure(failed, op: str, stopped_text: str) -> XwtError:
+    """The error after steps failed: those left with `op` in progress stopped on
+    conflicts; the others failed before starting (git said why)."""
+    stopped = [(l, p) for l, p in failed if git.in_progress(p) == op]
+    other = [(l, p) for l, p in failed if (l, p) not in stopped]
+    parts = []
+    if stopped:
+        parts.append(f"the {op} stopped in {', '.join(l for l, _ in stopped)}: {stopped_text} in:"
+                     + "".join(f"\n    {p}" for _, p in stopped))
+    if other:
+        parts.append(f"`git {op}` failed in {', '.join(l for l, _ in other)} (see git's message "
+                     f"above); nothing was changed there")
+    return XwtError("\n".join(parts))
+
+
+def _untracked(path: Path) -> set[str]:
+    return {e.path for e in git.status_entries(path, "--untracked-files=all") if e.xy == "??"}
+
+
+def _changed_files(path: Path, base: str, tip: str) -> list[str]:
+    """Files changed from the merge base of `base` and `tip` to `tip` (renames
+    as a delete plus an add, so both paths count)."""
+    out = git.out(path, "diff", "--name-only", "--no-renames", "-z",
+                  f"refs/heads/{base}...refs/heads/{tip}")
+    return [f for f in out.split("\0") if f]
+
+
+def _some_files(files: list[str], n: int = 5) -> str:
+    return ", ".join(files[:n]) + (f" and {len(files) - n} more" if len(files) > n else "")
 
 
 # ---------------------------------------------------------------------------
@@ -681,8 +726,14 @@ def rebase_down(project: Project, rebase_args: list[str], *, dry_run: bool) -> i
         elif _tracked_changes(co.path):
             problems.append(f"{co.label} has uncommitted changes to tracked files; commit or "
                             f"stash them first")
-        steps.append((f"{co.label}: rebase {name} onto {integ}", co.path,
-                      ["git", "-C", str(co.path), "rebase", *rebase_args, integ]))
+        else:
+            clash = sorted(_untracked(co.path) & set(_changed_files(co.path, name, integ)))
+            if clash:
+                problems.append(f"{co.label} has untracked files that the rebase would overwrite "
+                                f"({_some_files(clash)}); move or remove them first")
+        steps.append((f"{co.label}: rebase {name} onto {integ}", co.label, co.path,
+                      ["git", "-C", str(co.path), "rebase", *rebase_args,
+                       git.branch_arg(co.path, integ)]))
     if problems:
         refuse("rebase", problems)
     if not steps:
@@ -690,10 +741,8 @@ def rebase_down(project: Project, rebase_args: list[str], *, dry_run: bool) -> i
         return 0
     failed = _run_planned(steps, dry_run=dry_run)
     if failed:
-        where = "".join(f"\n    {path}" for _, path in failed)
-        raise XwtError(f"the rebase stopped in {', '.join(l.split(':')[0] for l, _ in failed)}: "
-                       f"resolve the conflicts, then run `git rebase --continue` (or "
-                       f"`git rebase --abort`) in:{where}")
+        raise _failure(failed, "rebase", "resolve the conflicts, then run `git rebase "
+                                         "--continue` (or `git rebase --abort`)")
     return 0
 
 
@@ -730,20 +779,21 @@ def merge_up(project: Project, *, dry_run: bool, no_ff: bool) -> int:
             ab = git.ahead_behind(main, integ, name)
             n = plural(ab[1], "commit") if ab else "commits"
             problems.append(f"{rname}: {integ} has {n} not in {name}; run `xwt rebase-down` first")
-        changed = git.out(main, "diff", "--name-only", "-z", f"refs/heads/{integ}...refs/heads/{name}")
-        changed = [f for f in changed.split("\0") if f]
         dirty = {e.path for e in git.status_entries(main, "--untracked-files=all")}
-        clash = [f for f in changed if f in dirty]
+        clash = [f for f in _changed_files(main, integ, name) if f in dirty]
         if clash:
-            shown = ", ".join(clash[:5]) + (f" and {len(clash) - 5} more" if len(clash) > 5 else "")
             problems.append(f"{mlabel} has uncommitted changes to, or untracked copies of, files "
-                            f"the merge changes ({shown}); commit, stash or move them first")
+                            f"the merge changes ({_some_files(clash)}); commit, stash or move "
+                            f"them first")
+        if no_ff and not git.ok(main, "diff", "--cached", "--quiet"):
+            problems.append(f"{mlabel} has staged changes, and a merge commit needs a clean "
+                            f"index; commit or unstage them first")
         mop = git.in_progress(main)
         if mop:
             problems.append(f"{mlabel} has a {mop} in progress: {_finish_hint(mop, main)}")
         mode = ["--no-ff", "--no-edit"] if no_ff else ["--ff-only"]
-        steps.append((f"{mlabel}: merge {name} into {integ}", main,
-                      ["git", "-C", str(main), "merge", *mode, name]))
+        steps.append((f"{mlabel}: merge {name} into {integ}", mlabel, main,
+                      ["git", "-C", str(main), "merge", *mode, git.branch_arg(main, name)]))
     if problems:
         refuse("merge", problems)
     if not steps:
@@ -751,9 +801,8 @@ def merge_up(project: Project, *, dry_run: bool, no_ff: bool) -> int:
         return 0
     failed = _run_planned(steps, dry_run=dry_run)
     if failed:
-        where = "".join(f"\n    {path}" for _, path in failed)
-        raise XwtError(f"the merge stopped in {', '.join(l.split(':')[0] for l, _ in failed)}: "
-                       f"resolve the conflicts and commit, or `git merge --abort`, in:{where}")
+        raise _failure(failed, "merge", "resolve the conflicts and commit, or run "
+                                        "`git merge --abort`,")
     if not dry_run:
         ui.info(f"landed {name}")
     return 0
@@ -772,9 +821,51 @@ def _locked(repo: Repo, path: Path) -> bool:
     return any(e.path == path and e.locked for e in git.worktree_list(repo.main))
 
 
+def _unmanaged_checkouts(project: Project, target: Path) -> list[str]:
+    """Git checkouts inside `target` that aren't its xwt checkouts or their
+    submodules: a clone, or a worktree such as Claude Code's
+    .claude/worktrees/*. Removing the directory would destroy them."""
+    expected = {co.path for co in project.checkouts(target)}
+    mains = {(r.main / ".git").resolve(): r for r in project.repos}
+    found = []
+    for dirpath, dirnames, filenames in os.walk(target):
+        d = Path(dirpath)
+        has_git = ".git" in dirnames or ".git" in filenames
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        if not has_git or d in expected:
+            continue
+        if git.git(d, "rev-parse", "--show-superproject-working-tree").stdout.strip():
+            continue                                    # a submodule of a checkout
+        dirnames[:] = []
+        repo = mains.get(git.common_dir(d))
+        if repo is not None:
+            found.append(f"{d} is a git worktree of {repo.main} that xwt doesn't manage; "
+                         f"remove it first (`git -C {repo.main} worktree remove {d}`), or move "
+                         f"it out")
+        else:
+            found.append(f"{d} is a separate git checkout; move it out of {target} first")
+    return found
+
+
+def _submodule_only_commits(co: Checkout) -> list[str]:
+    """Submodules of `co` with commits on no remote-tracking branch. A linked
+    worktree's submodules keep their own store (in the main repo's
+    .git/worktrees/), which goes with the worktree."""
+    if not (co.path / ".gitmodules").exists():
+        return []
+    script = ('test -z "$(git rev-list -n 1 HEAD --branches --not --remotes)" '
+              '|| echo "$displaypath"')
+    res = git.git(co.path, "submodule", "foreach", "--quiet", "--recursive", script)
+    return [f"{co.label}/{sub} (a submodule) has commits that are on no remote branch; they "
+            f"are stored only in this worktree: push them first"
+            for sub in res.stdout.split()]
+
+
 def _delete_checks(project: Project, target: Path, name: str):
     """(problems --force overrides, problems it doesn't) for deleting `target`."""
     soft, hard = [], []
+    hard += _unmanaged_checkouts(project, target)
     for co in project.checkouts(target):
         if co.state == "missing":
             continue
@@ -808,6 +899,7 @@ def _delete_checks(project: Project, target: Path, name: str):
                 soft.append(f"{co.label} is detached at a commit that no branch contains")
         if _locked(co.repo, co.path):
             soft.append(f"{co.label} is locked (`git worktree lock`)")
+        soft += _submodule_only_commits(co)
     return soft, hard
 
 

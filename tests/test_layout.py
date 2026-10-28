@@ -79,3 +79,13 @@ def test_labels(w):
     project = Project.find(w.top)
     assert [c.label for c in project.checkouts(w.top)] == [
         "top/ (repo proj)", "top/liba", "top/libb"]
+
+
+def test_sub_repo_main_checkout_with_its_own_xwt_toml(w):
+    w.setup()
+    (w.top / "liba" / "xwt.toml").write_text("")
+    assert find_workspace(w.top / "liba" / "liba") == (w.top, w.top)
+    # A clone the toplevel doesn't list, with its own xwt.toml, is its own toplevel.
+    w.git(w.top, "clone", "-q", w.url("dep"), w.top / "other")
+    (w.top / "other" / "xwt.toml").write_text("")
+    assert find_workspace(w.top / "other") == (w.top / "other", w.top / "other")

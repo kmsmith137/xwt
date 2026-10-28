@@ -86,7 +86,8 @@ def direnv_allow(ws: Path) -> None:
     exe = shutil.which("direnv")
     if exe is None:
         return
-    rc = git.run_echo([exe, "allow", str(ws)])
+    ui.echo(["direnv", "allow", str(ws)])
+    rc = subprocess.run([exe, "allow", str(ws)]).returncode
     if rc != 0:
         ui.warn(f"`direnv allow {ws}` failed (exit status {rc}); run it by hand")
 

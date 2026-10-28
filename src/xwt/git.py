@@ -93,9 +93,22 @@ def is_clone(path) -> bool:
 
 
 def current_branch(path) -> str | None:
-    """The checked-out branch, or None when HEAD is detached."""
-    res = git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
-    return res.stdout.strip() if res.returncode == 0 else None
+    """The checked-out branch, or None when HEAD is detached. (Not `--short`,
+    which gives `heads/NAME` when a tag NAME also exists.)"""
+    res = git(path, "symbolic-ref", "--quiet", "HEAD")
+    ref = res.stdout.strip()
+    if res.returncode != 0 or not ref.startswith("refs/heads/"):
+        return None
+    return ref[len("refs/heads/"):]
+
+
+def branch_arg(path, name: str) -> str:
+    """`name` as an argument naming the branch: the short name, unless git would
+    resolve it to something else first (a tag of the same name)."""
+    res = git(path, "rev-parse", "--symbolic-full-name", name)
+    if res.returncode == 0 and res.stdout.strip() == f"refs/heads/{name}":
+        return name
+    return f"refs/heads/{name}"
 
 
 def in_progress(path) -> str | None:

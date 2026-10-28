@@ -220,11 +220,17 @@ branch (with `git branch -d`), and removes what is left of the directory.
 It refuses, listing every problem, if any checkout of the worktree has
 uncommitted changes to tracked files, untracked files that aren't ignored,
 commits on `NAME` not yet in the integration branch (run `xwt merge-up` first;
-being behind is fine), a rebase, merge or cherry-pick in progress, or a detached
-HEAD whose commits no branch contains. `--force` deletes anyway, losing
-uncommitted edits and untracked files, but an unmerged branch is always kept
-(`kept branch dev in pirate: not merged into kms; its commits are preserved`),
-so committed work survives.
+being behind is fine), a rebase, merge or cherry-pick in progress, a detached
+HEAD whose commits no branch contains, or a submodule with commits on no remote
+branch (a worktree's submodules keep their own store, which goes with it).
+`--force` deletes anyway, losing uncommitted edits and untracked files, but an
+unmerged branch is always kept (`kept branch dev in pirate: not merged into
+kms; its commits are preserved`), so committed work survives.
+
+It refuses even with `--force` if the worktree contains a git checkout that xwt
+doesn't manage: another git worktree (such as Claude Code's
+`.claude/worktrees/*`), or a separate clone (for example of a sub-repo since
+dropped from `xwt.toml`). Remove or move those first.
 
 **Ignored files are deleted with the worktree, without a question:** build
 products, `.venv`, and anything else the repos ignore. For example ch_top
@@ -294,14 +300,15 @@ and skip (with a warning) a checkout that isn't on the worktree's branch.
 `rebase-down` rebases only the repos that are behind; extra arguments after `--`
 go to `git rebase` (`xwt rebase-down -- -i` works: git's output and editor reach
 the terminal). It refuses if a checkout to be rebased has uncommitted changes to
-tracked files, or a rebase or merge already in progress.
+tracked files, untracked files the rebase would overwrite, or a rebase or merge
+already in progress.
 
 `merge-up` runs `git merge --ff-only dev` in each main checkout, where the
 integration branch is checked out. It refuses, merging nothing, if any repo
 needs a rebase first (`pirate: kms has 2 commits not in dev; run
 xwt rebase-down first`), or if a file the merge changes has uncommitted changes
 or an untracked copy in the main checkout. `--no-ff` makes a merge commit in
-each repo instead. Both commands take `--dry-run` to print what they would run.
+each repo instead (and needs a clean index in each main checkout). Both commands take `--dry-run` to print what they would run.
 
 Landing doesn't delete the worktree; the slot stays, and its branch keeps going.
 
@@ -512,7 +519,8 @@ With xsb (a sandbox launcher for coding agents), xwt needs nothing special:
   or to `/` outside `$HOME`) to the first git checkout whose repo's main
   checkout has `xwt.toml` and is either that checkout or a sibling of it. So
   from `~/ch/dev/pirate/src` it finds the worktree `~/ch/dev`; a submodule, or a
-  sub-repo that happens to have its own `xwt.toml`, doesn't capture it. Nested
+  sub-repo that happens to have its own `xwt.toml`, doesn't capture it (in the
+  toplevel too, as long as the toplevel's `xwt.toml` lists it). Nested
   toplevels aren't supported.
 - **Sub-repos are plain clones**, not git submodules, one directory each,
   directly in the toplevel. Submodules inside any repo are initialized in every

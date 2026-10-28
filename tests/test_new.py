@@ -182,3 +182,21 @@ def test_refuses_envrc_section_with_a_tracked_envrc(w):
     assert not (w.group / "dev").exists()
     r = w.xwt("init")
     assert r.rc == 1 and "remove one of them" in r.err
+
+
+def test_refuses_when_a_branch_name_slash_something_exists(w):
+    w.setup()
+    w.git(w.top / "libb", "branch", "dev/foo", "kms")
+    r = w.xwt("new", "dev")
+    assert r.rc == 1
+    assert "libb has a branch dev/foo, so it can't have a branch dev" in r.err
+    nothing_created(w, "dev")
+
+
+def test_lists_every_problem(w):
+    w.setup()
+    (w.group / "kms").mkdir()
+    r = w.xwt("new", "kms")
+    assert r.rc == 1
+    assert f"{w.group / 'kms'} already exists" in r.err
+    assert "kms is the integration branch of top/liba" in r.err
