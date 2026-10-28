@@ -606,3 +606,153 @@ def venv(project: Project, *, recreate: bool, bare: bool) -> int:
         ui.warn(f"{path} differs from what xwt.toml now produces; `xwt init` here updates it")
     envrc.build_venv(project, ws, recreate=recreate, bare=bare)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Moving commits: shared pieces
+# ---------------------------------------------------------------------------
+
+def _on_branch(co: Checkout, name: str) -> tuple[bool, str]:
+    """Whether checkout `co` is on branch `name` (or in the middle of rebasing
+    it), and a phrase for where it is otherwise."""
+    cur = git.current_branch(co.path)
+    if cur == name:
+        return True, ""
+    if cur is None and git.in_progress(co.path) == "rebase" and git.rebasing_branch(co.path) == name:
+        return True, ""
+    return False, f"on {cur}" if cur else "detached"
+
+
+def _tracked_changes(path: Path) -> bool:
+    return bool(git.status_entries(path, "--untracked-files=no", "--ignore-submodules=all"))
+
+
+def _finish_hint(op: str, path: Path) -> str:
+    if op == "merge":
+        return f"finish it with `git commit` or `git merge --abort` in {path}"
+    return f"finish it with `git {op} --continue` or `--abort` in {path}"
+
+
+def _run_planned(steps, *, dry_run: bool) -> list[tuple[str, Path]]:
+    """Run (header, path, cmd) steps one after another, each under its header,
+    with git's output going straight to the terminal. Returns the (label, path)
+    of each step that failed."""
+    failed = []
+    for label, path, cmd in steps:
+        ui.header(label)
+        if dry_run:
+            ui.out(f"{ui.PREFIX}(dry run) $ {ui.cmdline(cmd)}")
+        elif git.run_echo(cmd) != 0:
+            failed.append((label, path))
+        ui.out()
+    return failed
+
+
+# ---------------------------------------------------------------------------
+# xwt rebase-down (§7.10)
+# ---------------------------------------------------------------------------
+
+def rebase_down(project: Project, rebase_args: list[str], *, dry_run: bool) -> int:
+    if project.in_toplevel:
+        raise XwtError("there's no branch to rebase in the toplevel; run this in a worktree")
+    ws = project.workspace
+    name = ws.name
+    problems = project.integ_problems()
+    steps = []
+    for co in usable_checkouts(project, ws):
+        on, where = _on_branch(co, name)
+        if not on:
+            ui.warn(f"{co.label} is {where}, not on {name}; skipping it")
+            continue
+        integ = project.integ(co.repo)
+        if integ is None:
+            continue                            # reported by integ_problems
+        ab = git.ahead_behind(co.path, integ, name)
+        if ab is None:
+            problems.append(f"can't compare {name} with {integ} in {co.label}")
+            continue
+        if ab[1] == 0:
+            ui.info(f"{co.label}: {name} isn't behind {integ}; nothing to rebase")
+            continue
+        op = git.in_progress(co.path)
+        if op:
+            problems.append(f"{co.label} has a {op} in progress: {_finish_hint(op, co.path)}")
+        elif _tracked_changes(co.path):
+            problems.append(f"{co.label} has uncommitted changes to tracked files; commit or "
+                            f"stash them first")
+        steps.append((f"{co.label}: rebase {name} onto {integ}", co.path,
+                      ["git", "-C", str(co.path), "rebase", *rebase_args, integ]))
+    if problems:
+        refuse("rebase", problems)
+    if not steps:
+        ui.info("nothing to rebase")
+        return 0
+    failed = _run_planned(steps, dry_run=dry_run)
+    if failed:
+        where = "".join(f"\n    {path}" for _, path in failed)
+        raise XwtError(f"the rebase stopped in {', '.join(l.split(':')[0] for l, _ in failed)}: "
+                       f"resolve the conflicts, then run `git rebase --continue` (or "
+                       f"`git rebase --abort`) in:{where}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# xwt merge-up (§7.11)
+# ---------------------------------------------------------------------------
+
+def merge_up(project: Project, *, dry_run: bool, no_ff: bool) -> int:
+    if project.in_toplevel:
+        raise XwtError("merge-up lands a worktree's branch; run it in that worktree")
+    ws = project.workspace
+    name = ws.name
+    problems = project.integ_problems()
+    steps = []
+    for co in usable_checkouts(project, ws):
+        on, where = _on_branch(co, name)
+        if not on:
+            ui.warn(f"{co.label} is {where}, not on {name}; skipping it")
+            continue
+        repo = co.repo
+        integ = project.integ(repo)
+        if integ is None:
+            continue
+        main = repo.main
+        mlabel = project.label(project.toplevel, repo)
+        if git.is_ancestor(main, f"refs/heads/{name}", f"refs/heads/{integ}"):
+            ui.info(f"{mlabel}: {integ} already contains {name}; nothing to land")
+            continue
+        rname = project.repo_name(repo)
+        op = git.in_progress(co.path)
+        if op:
+            problems.append(f"{co.label} has a {op} in progress: {_finish_hint(op, co.path)}")
+        if not no_ff and not git.is_ancestor(main, f"refs/heads/{integ}", f"refs/heads/{name}"):
+            ab = git.ahead_behind(main, integ, name)
+            n = plural(ab[1], "commit") if ab else "commits"
+            problems.append(f"{rname}: {integ} has {n} not in {name}; run `xwt rebase-down` first")
+        changed = git.out(main, "diff", "--name-only", "-z", f"refs/heads/{integ}...refs/heads/{name}")
+        changed = [f for f in changed.split("\0") if f]
+        dirty = {e.path for e in git.status_entries(main, "--untracked-files=all")}
+        clash = [f for f in changed if f in dirty]
+        if clash:
+            shown = ", ".join(clash[:5]) + (f" and {len(clash) - 5} more" if len(clash) > 5 else "")
+            problems.append(f"{mlabel} has uncommitted changes to, or untracked copies of, files "
+                            f"the merge changes ({shown}); commit, stash or move them first")
+        mop = git.in_progress(main)
+        if mop:
+            problems.append(f"{mlabel} has a {mop} in progress: {_finish_hint(mop, main)}")
+        mode = ["--no-ff", "--no-edit"] if no_ff else ["--ff-only"]
+        steps.append((f"{mlabel}: merge {name} into {integ}", main,
+                      ["git", "-C", str(main), "merge", *mode, name]))
+    if problems:
+        refuse("merge", problems)
+    if not steps:
+        ui.info(f"nothing to land for {name}")
+        return 0
+    failed = _run_planned(steps, dry_run=dry_run)
+    if failed:
+        where = "".join(f"\n    {path}" for _, path in failed)
+        raise XwtError(f"the merge stopped in {', '.join(l.split(':')[0] for l, _ in failed)}: "
+                       f"resolve the conflicts and commit, or `git merge --abort`, in:{where}")
+    if not dry_run:
+        ui.info(f"landed {name}")
+    return 0

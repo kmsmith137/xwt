@@ -218,7 +218,9 @@ class World:
     def rev(self, cwd, ref="HEAD") -> str:
         return self.git(cwd, "rev-parse", ref)
 
-    def commit(self, repo, rel="file.txt", text=None, msg=None) -> str:
+    def commit(self, repo, rel=None, text=None, msg=None) -> str:
+        """Commit `text` to `rel` (by default a new file, so commits don't conflict)."""
+        rel = rel or f"file-{os.urandom(4).hex()}.txt"
         p = Path(repo) / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text if text is not None else f"{rel} {os.urandom(4).hex()}\n")
