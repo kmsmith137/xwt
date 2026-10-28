@@ -143,10 +143,10 @@ class Project:
             return None
         return git.current_branch(repo.main)
 
-    def integ_problems(self) -> list[str]:
-        """Main checkouts that aren't on their integration branch."""
+    def integ_problems(self, repos=None) -> list[str]:
+        """Main checkouts (of `repos`, default all) that aren't on their integration branch."""
         problems = []
-        for repo in self.repos:
+        for repo in self.repos if repos is None else repos:
             if not self.cloned(repo):
                 continue
             label = self.label(self.toplevel, repo)
