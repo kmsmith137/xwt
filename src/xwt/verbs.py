@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -755,4 +756,128 @@ def merge_up(project: Project, *, dry_run: bool, no_ff: bool) -> int:
                        f"resolve the conflicts and commit, or `git merge --abort`, in:{where}")
     if not dry_run:
         ui.info(f"landed {name}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# xwt delete (§7.7)
+# ---------------------------------------------------------------------------
+
+def _some(entries, n=5) -> str:
+    shown = ", ".join(e.path for e in entries[:n])
+    return shown + (f" and {len(entries) - n} more" if len(entries) > n else "")
+
+
+def _locked(repo: Repo, path: Path) -> bool:
+    return any(e.path == path and e.locked for e in git.worktree_list(repo.main))
+
+
+def _delete_checks(project: Project, target: Path, name: str):
+    """(problems --force overrides, problems it doesn't) for deleting `target`."""
+    soft, hard = [], []
+    for co in project.checkouts(target):
+        if co.state == "missing":
+            continue
+        if co.state == "foreign":
+            if os.path.lexists(co.path / ".git"):
+                hard.append(f"{co.path} is a separate git repository, not a worktree of "
+                            f"{co.repo.main}; move it out of {target} first")
+            else:
+                soft.append(f"{co.path} is not a git worktree of {co.repo.main}")
+            continue
+        entries = git.status_entries(co.path)
+        tracked = [e for e in entries if e.xy != "??"]
+        untracked = [e for e in entries if e.xy == "??"]
+        if tracked:
+            soft.append(f"{co.label} has uncommitted changes to tracked files: {_some(tracked)}")
+        if untracked:
+            soft.append(f"{co.label} has untracked files: {_some(untracked)}")
+        integ = project.integ(co.repo)
+        main = co.repo.main
+        if integ and integ != name and git.branch_exists(main, name):
+            ab = git.ahead_behind(main, integ, name)
+            if ab and ab[0]:
+                soft.append(f"{co.label}: {plural(ab[0], 'commit')} on {name} not in {integ}; "
+                            f"run `xwt merge-up` first")
+        op = git.in_progress(co.path)
+        if op:
+            soft.append(f"{co.label} has a {op} in progress")
+        elif git.current_branch(co.path) is None:
+            # A detached HEAD's commits are lost with the worktree unless a branch has them.
+            if not git.out(co.path, "for-each-ref", "--contains", "HEAD", "refs/heads"):
+                soft.append(f"{co.label} is detached at a commit that no branch contains")
+        if _locked(co.repo, co.path):
+            soft.append(f"{co.label} is locked (`git worktree lock`)")
+    return soft, hard
+
+
+def _delete_branches(project: Project, name: str) -> None:
+    """`git branch -d NAME` in each repo, where NAME is merged into the
+    integration branch; otherwise keep it, with a warning."""
+    for repo in project.repos:
+        if not project.cloned(repo) or not git.branch_exists(repo.main, name):
+            continue
+        integ = project.integ(repo)
+        rname = project.repo_name(repo)
+        if integ is None or integ == name:
+            continue
+        # Checked here rather than left to `git branch -d`, which also accepts a
+        # branch merged only into its upstream.
+        if not git.is_ancestor(repo.main, f"refs/heads/{name}", f"refs/heads/{integ}"):
+            ui.warn(f"kept branch {name} in {rname}: not merged into {integ}; its commits are "
+                    f"preserved")
+            continue
+        rc = git.git_echo(repo.main, "branch", "-d", name)
+        if rc != 0:
+            ui.warn(f"kept branch {name} in {rname}: `git branch -d` refused it")
+
+
+def delete(project: Project, name: str, *, force: bool) -> int:
+    target = project.group / name
+    if target == project.toplevel:
+        raise XwtError(f"{target} is the toplevel; it can't be deleted")
+    cwd = Path(os.getcwd()).resolve()
+    if cwd == target or target in cwd.parents:
+        raise XwtError(f"the current directory is inside {target}; run `xwt delete {name}` "
+                       f"from the toplevel or another worktree")
+    wt = next((w for w in project.worktrees() if w.name == name), None)
+    if wt is None:
+        what = "isn't a worktree" if os.path.lexists(target) else "doesn't exist and isn't a worktree"
+        raise XwtError(f"{target} {what} of {project.toplevel}")
+    problems = project.integ_problems()
+    if problems:
+        refuse(f"delete {name}", problems)
+
+    if not wt.exists:
+        ui.info(f"{target} is already gone; clearing git's record of it and deleting its "
+                f"merged branches")
+        for repo in project.repos:
+            if project.cloned(repo):
+                _prune_if_needed(repo)
+        _delete_branches(project, name)
+        return 0
+
+    soft, hard = _delete_checks(project, target, name)
+    if hard:
+        refuse(f"delete {name}, even with --force" if force else f"delete {name}", hard + soft)
+    if soft and not force:
+        refuse(f"delete {name}", soft + [
+            "with --force these are lost; committed work stays on its branches"])
+    if soft:
+        ui.warn(f"deleting {name} anyway (--force):\n" + ui.bullet_list(soft))
+
+    checkouts = [co for co in project.checkouts(target) if co.ok]
+    for co in checkouts[1:] + checkouts[:1]:          # sub-repos first, then the toplevel's
+        flags = ["--force", "--force"] if _locked(co.repo, co.path) else ["--force"]
+        rc = git.git_echo(co.repo.main, "worktree", "remove", *flags, str(co.path))
+        if rc != 0:
+            ui.warn(f"`git worktree remove` failed for {co.label}; removing its files instead")
+    if os.path.lexists(target):
+        ui.info(f"removing what is left of {target}")
+        shutil.rmtree(target)                      # unlinks symlinks; never follows them
+    for repo in project.repos:
+        if project.cloned(repo):
+            _prune_if_needed(repo)
+    _delete_branches(project, name)
+    ui.info(f"deleted worktree {name}")
     return 0
