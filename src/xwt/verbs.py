@@ -587,3 +587,22 @@ def _numbered(i: int, text: str) -> str:
                                      subsequent_indent=indent, break_long_words=False,
                                      break_on_hyphens=False))
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# xwt venv (§7.6)
+# ---------------------------------------------------------------------------
+
+def venv(project: Project, *, recreate: bool, bare: bool) -> int:
+    ec = project.config.envrc
+    if ec is None or ec.venv is None:
+        raise XwtError(f"{project.toplevel / CONFIG_NAME} has no [envrc.venv], so xwt builds "
+                       f"no venv")
+    ws = project.workspace
+    path = ws / envrc.ENVRC
+    if not path.exists():
+        raise XwtError(f"{ws} has no .envrc; run `xwt init` here first")
+    if path.read_text() != envrc.envrc_text(project):
+        ui.warn(f"{path} differs from what xwt.toml now produces; `xwt init` here updates it")
+    envrc.build_venv(project, ws, recreate=recreate, bare=bare)
+    return 0
